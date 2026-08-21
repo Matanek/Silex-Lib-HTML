@@ -40,6 +40,18 @@ public struct ParseError {
     let detail:str
 }
 
+public enum SelectorErrorKind {
+    empty
+    syntax
+    complexity_limit
+}
+
+public struct SelectorError {
+    let kind:SelectorErrorKind
+    let byte_offset:int
+    let detail:str
+}
+
 public class Node {
     private let raw_kind:int
     private var node_name:str
@@ -47,7 +59,7 @@ public class Node {
     private var node_attributes:Attribute[]
     private var node_children:Node[]
 
-    private init(raw_kind:int, name:str, value:str) {
+    package init(raw_kind:int = 1, name:str = "", value:str = "") {
         self.raw_kind = raw_kind
         self.node_name = name
         self.node_value = value
@@ -133,7 +145,20 @@ public class Node {
         if self.raw_kind != 1 && self.raw_kind != 3 {
             panic("HTML children can only be appended to a document or element")
         }
+        if child == self || child.contains_node(self) {
+            panic("HTML nodes cannot contain themselves")
+        }
         self.node_children.append(child)
+    }
+
+    func prepend(child:Node) {
+        if self.raw_kind != 1 && self.raw_kind != 3 {
+            panic("HTML children can only be prepended to a document or element")
+        }
+        if child == self || child.contains_node(self) {
+            panic("HTML nodes cannot contain themselves")
+        }
+        self.node_children.prepend(child)
     }
 
     func append_element(name:str) Node {
@@ -160,6 +185,18 @@ public class Node {
         var child = Node.comment(value)
         self.append(child)
         return child
+    }
+
+    func clear() {
+        if self.raw_kind != 1 && self.raw_kind != 3 {
+            panic("HTML clear requires a document or element")
+        }
+        self.node_children = []
+    }
+
+    func set_text(value:str) {
+        self.require_element("set_text")
+        self.node_children = [Node.text(value)]
     }
 
     func text_content() str {
@@ -193,6 +230,39 @@ public class Node {
         return false
     }
 
+    func add_class(name:str) {
+        self.require_element("add_class")
+        require_class_name(name)
+        if self.has_class(name) { return }
+        if let existing = self.attribute("class") {
+            let normalized = remove_token(existing, "")
+            if normalized == "" { self.set_attribute("class", name) }
+            else { self.set_attribute("class", normalized + " " + name) }
+        } else { self.set_attribute("class", name) }
+    }
+
+    func remove_class(name:str) bool {
+        self.require_element("remove_class")
+        require_class_name(name)
+        if let existing = self.attribute("class") {
+            if !token_contains(existing, name) { return false }
+            let changed = remove_token(existing, name)
+            if changed == "" { self.remove_attribute("class") }
+            else { self.set_attribute("class", changed) }
+            return true
+        }
+        return false
+    }
+
+    func toggle_class(name:str) bool {
+        if self.remove_class(name) { return false }
+        self.add_class(name)
+        return true
+    }
+
+    func select(selector:str) Selection { return select_from(self, selector) }
+    func try_select(selector:str) Result<Selection, SelectorError> { return try_select_from(self, selector) }
+
     private func require_element(operation:str) {
         if self.raw_kind != 3 { panic("HTML $(operation) requires an element") }
     }
@@ -202,11 +272,171 @@ public class Node {
         for child in self.node_children { child.collect_elements(name, output) }
     }
 
+    private func contains_node(expected:Node) bool {
+        if self == expected { return true }
+        for child in self.node_children {
+            if child.contains_node(expected) { return true }
+        }
+        return false
+    }
+
     package func raw_name() str { return self.node_name }
     package func raw_value() str { return self.node_value }
     package func raw_attributes() Attribute[] { return self.node_attributes }
     package func raw_children() Node[] { return self.node_children }
     package func raw_kind_value() int { return self.raw_kind }
+    package func is_container() bool { return self.raw_kind == 1 || self.raw_kind == 3 }
+    package func is_element() bool { return self.raw_kind == 3 }
+
+    package func prepend_copy(child:Node) { self.node_children.prepend(child.deep_copy()) }
+    package func append_copy(child:Node) { self.node_children.append(child.deep_copy()) }
+
+    package func remove_child(expected:Node) bool {
+        var index = 0
+        while index < self.node_children.count() {
+            if self.node_children[index] == expected {
+                self.node_children.take(index)
+                return true
+            }
+            index++
+        }
+        return false
+    }
+
+    package func replace_child(expected:Node, replacement:Node) bool {
+        var index = 0
+        while index < self.node_children.count() {
+            if self.node_children[index] == expected {
+                self.node_children[index] = replacement.deep_copy()
+                return true
+            }
+            index++
+        }
+        return false
+    }
+
+    package func deep_copy() Node {
+        var duplicate = Node(self.raw_kind, self.node_name, self.node_value)
+        duplicate.node_attributes = self.node_attributes
+        for child in self.node_children { duplicate.node_children.append(child.deep_copy()) }
+        return duplicate
+    }
+}
+
+public class Selection {
+    private var root:Node
+    private var selected:Node[]
+
+    private init(root:Node, nodes:Node[]) {
+        self.root = root
+        self.selected = nodes
+    }
+
+    func count() int { return self.selected.count() }
+    func is_empty() bool { return self.selected.is_empty() }
+    func nodes() Node[] { return self.selected }
+
+    func first() Node? {
+        if self.selected.is_empty() { return null }
+        return self.selected[0]
+    }
+
+    func at(index:int) Node? {
+        var normalized = index
+        if normalized < 0 { normalized += self.selected.count() }
+        if normalized < 0 || normalized >= self.selected.count() { return null }
+        return self.selected[normalized]
+    }
+
+    func text_content() str {
+        var result = ""
+        for node in self.selected { result += node.text_content() }
+        return result
+    }
+
+    func find(selector:str) Selection { return selection_find(self, selector) }
+    func try_find(selector:str) Result<Selection, SelectorError> { return selection_try_find(self, selector) }
+    func filter(selector:str) Selection { return selection_filter(self, selector) }
+    func try_filter(selector:str) Result<Selection, SelectorError> { return selection_try_filter(self, selector) }
+    func children(selector:str = "*") Selection { return selection_children(self, selector) }
+    func try_children(selector:str = "*") Result<Selection, SelectorError> {
+        return selection_try_children(self, selector)
+    }
+    func parent() Selection { return selection_parent(self) }
+    func parents() Selection { return selection_parents(self) }
+    func siblings() Selection { return selection_siblings(self) }
+    func next() Selection { return selection_adjacent(self, true) }
+    func previous() Selection { return selection_adjacent(self, false) }
+    func closest(selector:str) Selection { return selection_closest(self, selector) }
+    func try_closest(selector:str) Result<Selection, SelectorError> { return selection_try_closest(self, selector) }
+
+    func set_attribute(name:str, value:str = "") {
+        for node in self.selected { if node.is_element() { node.set_attribute(name, value) } }
+    }
+
+    func remove_attribute(name:str) int {
+        var count = 0
+        for node in self.selected { if node.is_element() && node.remove_attribute(name) { count++ } }
+        return count
+    }
+
+    func add_class(name:str) {
+        for node in self.selected { if node.is_element() { node.add_class(name) } }
+    }
+
+    func remove_class(name:str) int {
+        var count = 0
+        for node in self.selected { if node.is_element() && node.remove_class(name) { count++ } }
+        return count
+    }
+
+    func toggle_class(name:str) {
+        for node in self.selected { if node.is_element() { node.toggle_class(name) } }
+    }
+
+    func set_text(value:str) {
+        for node in self.selected { if node.is_element() { node.set_text(value) } }
+    }
+
+    func append(node:Node) {
+        for selected in self.selected { if selected.is_container() { selected.append_copy(node) } }
+    }
+
+    func append_all(nodes:Node[]) {
+        for selected in self.selected {
+            if selected.is_container() {
+                for node in nodes { selected.append_copy(node) }
+            }
+        }
+    }
+
+    func prepend(node:Node) {
+        for selected in self.selected { if selected.is_container() { selected.prepend_copy(node) } }
+    }
+
+    func remove() int {
+        var count = 0
+        for node in self.selected {
+            if let parent = find_parent(self.root, node) {
+                if parent.remove_child(node) { count++ }
+            }
+        }
+        return count
+    }
+
+    func replace_with(node:Node) int {
+        var count = 0
+        for selected in self.selected {
+            if let parent = find_parent(self.root, selected) {
+                if parent.replace_child(selected, node) { count++ }
+            }
+        }
+        return count
+    }
+
+    package func raw_root() Node { return self.root }
+    package func raw_nodes() Node[] { return self.selected }
+    package static func from(root:Node, nodes:Node[]) Selection { return Selection(root, nodes) }
 }
 
 public func document() Node { return Node.document() }
@@ -253,6 +483,32 @@ public func parse(source:str, options:ParseOptions) Node {
         success(document) => { return document }
         failure(error) => { panic("$(error.line):$(error.column): " + error.detail) }
     }
+}
+
+public func try_parse_fragment(source:str) Result<Node[], ParseError> {
+    return try_parse_fragment(source, default_parse_options())
+}
+
+public func try_parse_fragment(source:str, options:ParseOptions) Result<Node[], ParseError> {
+    match try_parse(source, options) {
+        success(document) => { return Result<Node[], ParseError>.success(document.children()) }
+        failure(error) => { return Result<Node[], ParseError>.failure(error) }
+    }
+}
+
+public func parse_fragment(source:str) Node[] { return parse_fragment(source, default_parse_options()) }
+
+public func parse_fragment(source:str, options:ParseOptions) Node[] {
+    match try_parse_fragment(source, options) {
+        success(nodes) => { return nodes }
+        failure(error) => { panic("$(error.line):$(error.column): " + error.detail) }
+    }
+}
+
+public func select(root:Node, selector:str) Selection { return select_from(root, selector) }
+
+public func try_select(root:Node, selector:str) Result<Selection, SelectorError> {
+    return try_select_from(root, selector)
 }
 
 public func serialize(node:Node) str { return serialize(node, Format.compact) }
@@ -515,6 +771,517 @@ class Parser {
     }
 }
 
+struct SelectorAttribute {
+    let name:str
+    let value:str?
+}
+
+struct SimpleSelector {
+    let tag:str?
+    let ids:str[]
+    let classes:str[]
+    let attributes:SelectorAttribute[]
+}
+
+struct SelectorStep {
+    // 0 begins a group, 1 is a descendant and 2 is a direct child.
+    let relation:int
+    let simple:SimpleSelector
+}
+
+struct SelectorGroup {
+    let steps:SelectorStep[]
+}
+
+class SelectorParser {
+    private let input:uint8[]
+    private var offset:int
+    private var step_count:int
+
+    init(source:str) {
+        self.input = UTF8.bytes(source)
+        self.offset = 0
+        self.step_count = 0
+    }
+
+    func run() Result<SelectorGroup[], SelectorError> {
+        if self.input.count() > 4_096 {
+            return self.failure(SelectorErrorKind.complexity_limit, "HTML selector exceeds 4096 bytes")
+        }
+        self.space()
+        if self.offset >= self.input.count() {
+            return self.failure(SelectorErrorKind.empty, "HTML selector cannot be empty")
+        }
+        var groups:SelectorGroup[] = []
+        while self.offset < self.input.count() {
+            if groups.count() >= 32 {
+                return self.failure(SelectorErrorKind.complexity_limit, "HTML selector exceeds 32 groups")
+            }
+            match self.group() {
+                success(group) => { groups.append(group) }
+                failure(error) => { return Result<SelectorGroup[], SelectorError>.failure(error) }
+            }
+            self.space()
+            if self.offset >= self.input.count() { break }
+            if self.input[self.offset] != 44 {
+                return self.failure(SelectorErrorKind.syntax, "expected ',' between selector groups")
+            }
+            self.offset++
+            self.space()
+            if self.offset >= self.input.count() {
+                return self.failure(SelectorErrorKind.syntax, "expected selector after ','")
+            }
+        }
+        return Result<SelectorGroup[], SelectorError>.success(groups)
+    }
+
+    private func group() Result<SelectorGroup, SelectorError> {
+        var steps:SelectorStep[] = []
+        var relation = 0
+        while self.offset < self.input.count() && self.input[self.offset] != 44 {
+            if self.step_count >= 64 {
+                return Result<SelectorGroup, SelectorError>.failure(self.error(
+                    SelectorErrorKind.complexity_limit,
+                    "HTML selector exceeds 64 compound steps"
+                ))
+            }
+            match self.simple() {
+                success(simple) => {
+                    steps.append(SelectorStep(relation:relation, simple:simple))
+                    self.step_count++
+                }
+                failure(error) => { return Result<SelectorGroup, SelectorError>.failure(error) }
+            }
+            let separated = self.space()
+            if self.offset >= self.input.count() || self.input[self.offset] == 44 { break }
+            if self.input[self.offset] == 62 {
+                self.offset++
+                self.space()
+                relation = 2
+                if self.offset >= self.input.count() || self.input[self.offset] == 44 || self.input[self.offset] == 62 {
+                    return Result<SelectorGroup, SelectorError>.failure(self.error(
+                        SelectorErrorKind.syntax,
+                        "expected selector after '>'"
+                    ))
+                }
+            } elif separated {
+                relation = 1
+            } else {
+                return Result<SelectorGroup, SelectorError>.failure(self.error(
+                    SelectorErrorKind.syntax,
+                    "expected whitespace, '>' or ',' between selectors"
+                ))
+            }
+        }
+        if steps.is_empty() {
+            return Result<SelectorGroup, SelectorError>.failure(self.error(
+                SelectorErrorKind.empty,
+                "HTML selector group cannot be empty"
+            ))
+        }
+        return Result<SelectorGroup, SelectorError>.success(SelectorGroup(steps:steps))
+    }
+
+    private func simple() Result<SimpleSelector, SelectorError> {
+        var tag:str? = null
+        var ids:str[] = []
+        var classes:str[] = []
+        var attributes:SelectorAttribute[] = []
+        var found = false
+        if self.offset < self.input.count() && self.input[self.offset] == 42 {
+            tag = "*"
+            self.offset++
+            found = true
+        } elif self.offset < self.input.count() && selector_name_byte(self.input[self.offset]) {
+            tag = ascii_lower(self.identifier())
+            found = true
+        }
+        while self.offset < self.input.count() {
+            let byte = self.input[self.offset]
+            if byte == 35 {
+                self.offset++
+                let value = self.identifier()
+                if value == "" {
+                    return Result<SimpleSelector, SelectorError>.failure(self.error(
+                        SelectorErrorKind.syntax,
+                        "expected an id after '#'"
+                    ))
+                }
+                ids.append(value)
+                found = true
+                continue
+            }
+            if byte == 46 {
+                self.offset++
+                let value = self.identifier()
+                if value == "" {
+                    return Result<SimpleSelector, SelectorError>.failure(self.error(
+                        SelectorErrorKind.syntax,
+                        "expected a class after '.'"
+                    ))
+                }
+                classes.append(value)
+                found = true
+                continue
+            }
+            if byte == 91 {
+                match self.attribute() {
+                    success(attribute) => { attributes.append(attribute) }
+                    failure(error) => { return Result<SimpleSelector, SelectorError>.failure(error) }
+                }
+                found = true
+                continue
+            }
+            break
+        }
+        if !found {
+            return Result<SimpleSelector, SelectorError>.failure(self.error(
+                SelectorErrorKind.syntax,
+                "expected a type, '*', '#id', '.class' or '[attribute]' selector"
+            ))
+        }
+        return Result<SimpleSelector, SelectorError>.success(SimpleSelector(
+            tag:tag,
+            ids:ids,
+            classes:classes,
+            attributes:attributes
+        ))
+    }
+
+    private func attribute() Result<SelectorAttribute, SelectorError> {
+        self.offset++
+        self.space()
+        let name = ascii_lower(self.identifier())
+        if name == "" {
+            return Result<SelectorAttribute, SelectorError>.failure(self.error(
+                SelectorErrorKind.syntax,
+                "expected an attribute name after '['"
+            ))
+        }
+        self.space()
+        var value:str? = null
+        if self.offset < self.input.count() && self.input[self.offset] == 61 {
+            self.offset++
+            self.space()
+            if self.offset >= self.input.count() {
+                return Result<SelectorAttribute, SelectorError>.failure(self.error(
+                    SelectorErrorKind.syntax,
+                    "expected an attribute value after '='"
+                ))
+            }
+            let quote = self.input[self.offset]
+            if quote == 34 || quote == 39 {
+                self.offset++
+                let start = self.offset
+                while self.offset < self.input.count() && self.input[self.offset] != quote { self.offset++ }
+                if self.offset >= self.input.count() {
+                    return Result<SelectorAttribute, SelectorError>.failure(self.error(
+                        SelectorErrorKind.syntax,
+                        "unterminated quoted attribute selector"
+                    ))
+                }
+                value = input_slice(self.input, start, self.offset)
+                self.offset++
+            } else {
+                let start = self.offset
+                while self.offset < self.input.count() && !whitespace(self.input[self.offset]) && self.input[self.offset] != 93 {
+                    self.offset++
+                }
+                if start == self.offset {
+                    return Result<SelectorAttribute, SelectorError>.failure(self.error(
+                        SelectorErrorKind.syntax,
+                        "attribute selector value cannot be empty"
+                    ))
+                }
+                value = input_slice(self.input, start, self.offset)
+            }
+            self.space()
+        }
+        if self.offset >= self.input.count() || self.input[self.offset] != 93 {
+            return Result<SelectorAttribute, SelectorError>.failure(self.error(
+                SelectorErrorKind.syntax,
+                "expected ']' after attribute selector"
+            ))
+        }
+        self.offset++
+        return Result<SelectorAttribute, SelectorError>.success(SelectorAttribute(name:name, value:value))
+    }
+
+    private func identifier() str {
+        let start = self.offset
+        while self.offset < self.input.count() && selector_name_byte(self.input[self.offset]) { self.offset++ }
+        return input_slice(self.input, start, self.offset)
+    }
+
+    private func space() bool {
+        let start = self.offset
+        while self.offset < self.input.count() && whitespace(self.input[self.offset]) { self.offset++ }
+        return self.offset > start
+    }
+
+    private func error(kind:SelectorErrorKind, detail:str) SelectorError {
+        return SelectorError(kind:kind, byte_offset:self.offset, detail:detail)
+    }
+
+    private func failure(kind:SelectorErrorKind, detail:str) Result<SelectorGroup[], SelectorError> {
+        return Result<SelectorGroup[], SelectorError>.failure(self.error(kind, detail))
+    }
+}
+
+func select_from(root:Node, selector:str) Selection {
+    match try_select_from(root, selector) {
+        success(selection) => { return selection }
+        failure(error) => { panic("HTML selector error at byte $(error.byte_offset): " + error.detail) }
+    }
+}
+
+func try_select_from(root:Node, selector:str) Result<Selection, SelectorError> {
+    match SelectorParser(selector).run() {
+        failure(error) => { return Result<Selection, SelectorError>.failure(error) }
+        success(groups) => {
+            var result:Node[] = []
+            collect_selected(root, groups, result)
+            return Result<Selection, SelectorError>.success(Selection.from(root, result))
+        }
+    }
+}
+
+func collect_selected(scope:Node, groups:SelectorGroup[], output:&Node[]) {
+    var path:Node[] = [scope]
+    collect_selected_children(scope, path, groups, output)
+}
+
+func collect_selected_children(current:Node, path:Node[], groups:SelectorGroup[], output:&Node[]) {
+    for child in current.raw_children() {
+        path.append(child)
+        if child.is_element() && matches_any(path, groups) { append_unique(output, child) }
+        collect_selected_children(child, path, groups, output)
+        path.take_last()
+    }
+}
+
+func matches_any(path:Node[], groups:SelectorGroup[]) bool {
+    if path.is_empty() { return false }
+    for group in groups {
+        if matches_group(path, path.count() - 1, group.steps, group.steps.count() - 1) { return true }
+    }
+    return false
+}
+
+func matches_group(path:Node[], node_index:int, steps:SelectorStep[], step_index:int) bool {
+    if node_index < 0 || step_index < 0 || !matches_simple(path[node_index], steps[step_index].simple) { return false }
+    if step_index == 0 { return true }
+    let relation = steps[step_index].relation
+    if relation == 2 {
+        return matches_group(path, node_index - 1, steps, step_index - 1)
+    }
+    var ancestor = node_index - 1
+    while ancestor >= 0 {
+        if matches_group(path, ancestor, steps, step_index - 1) { return true }
+        ancestor--
+    }
+    return false
+}
+
+func matches_simple(node:Node, simple:SimpleSelector) bool {
+    if !node.is_element() { return false }
+    if let tag = simple.tag {
+        if tag != "*" && node.raw_name() != tag { return false }
+    }
+    for id in simple.ids {
+        if let actual = node.attribute("id") {
+            if actual != id { return false }
+        } else { return false }
+    }
+    for class_name in simple.classes { if !node.has_class(class_name) { return false } }
+    for expected in simple.attributes {
+        if let actual = node.attribute(expected.name) {
+            if let value = expected.value { if actual != value { return false } }
+        } else { return false }
+    }
+    return true
+}
+
+func selection_find(selection:Selection, selector:str) Selection {
+    match selection_try_find(selection, selector) {
+        success(result) => { return result }
+        failure(error) => { panic("HTML selector error at byte $(error.byte_offset): " + error.detail) }
+    }
+}
+
+func selection_try_find(selection:Selection, selector:str) Result<Selection, SelectorError> {
+    match SelectorParser(selector).run() {
+        failure(error) => { return Result<Selection, SelectorError>.failure(error) }
+        success(groups) => {
+            var result:Node[] = []
+            for node in selection.raw_nodes() { collect_selected(node, groups, result) }
+            return Result<Selection, SelectorError>.success(Selection.from(selection.raw_root(), result))
+        }
+    }
+}
+
+func selection_filter(selection:Selection, selector:str) Selection {
+    match selection_try_filter(selection, selector) {
+        success(result) => { return result }
+        failure(error) => { panic("HTML selector error at byte $(error.byte_offset): " + error.detail) }
+    }
+}
+
+func selection_try_filter(selection:Selection, selector:str) Result<Selection, SelectorError> {
+    match SelectorParser(selector).run() {
+        failure(error) => { return Result<Selection, SelectorError>.failure(error) }
+        success(groups) => {
+            var result:Node[] = []
+            for node in selection.raw_nodes() {
+                if node_matches(selection.raw_root(), node, groups) { append_unique(result, node) }
+            }
+            return Result<Selection, SelectorError>.success(Selection.from(selection.raw_root(), result))
+        }
+    }
+}
+
+func selection_children(selection:Selection, selector:str) Selection {
+    match selection_try_children(selection, selector) {
+        success(result) => { return result }
+        failure(error) => { panic("HTML selector error at byte $(error.byte_offset): " + error.detail) }
+    }
+}
+
+func selection_try_children(selection:Selection, selector:str) Result<Selection, SelectorError> {
+    return selection_try_filter(
+        Selection.from(selection.raw_root(), element_children(selection.raw_nodes())),
+        selector
+    )
+}
+
+func element_children(nodes:Node[]) Node[] {
+    var result:Node[] = []
+    for node in nodes {
+        for child in node.raw_children() { if child.is_element() { append_unique(result, child) } }
+    }
+    return result
+}
+
+func selection_parent(selection:Selection) Selection {
+    var result:Node[] = []
+    for node in selection.raw_nodes() {
+        if let parent = find_parent(selection.raw_root(), node) {
+            if parent.is_element() { append_unique(result, parent) }
+        }
+    }
+    return Selection.from(selection.raw_root(), result)
+}
+
+func selection_parents(selection:Selection) Selection {
+    var result:Node[] = []
+    for node in selection.raw_nodes() {
+        var current = find_parent(selection.raw_root(), node)
+        while let parent = current {
+            if parent.is_element() { append_unique(result, parent) }
+            current = find_parent(selection.raw_root(), parent)
+        }
+    }
+    return Selection.from(selection.raw_root(), result)
+}
+
+func selection_siblings(selection:Selection) Selection {
+    var result:Node[] = []
+    for node in selection.raw_nodes() {
+        if let parent = find_parent(selection.raw_root(), node) {
+            for sibling in parent.raw_children() {
+                if sibling.is_element() && sibling != node { append_unique(result, sibling) }
+            }
+        }
+    }
+    return Selection.from(selection.raw_root(), result)
+}
+
+func selection_adjacent(selection:Selection, forward:bool) Selection {
+    var result:Node[] = []
+    for node in selection.raw_nodes() {
+        if let parent = find_parent(selection.raw_root(), node) {
+            var children = parent.raw_children()
+            var index = 0
+            while index < children.count() && children[index] != node { index++ }
+            if forward {
+                index++
+                while index < children.count() {
+                    if children[index].is_element() { append_unique(result, children[index]); break }
+                    index++
+                }
+            } else {
+                index--
+                while index >= 0 {
+                    if children[index].is_element() { append_unique(result, children[index]); break }
+                    index--
+                }
+            }
+        }
+    }
+    return Selection.from(selection.raw_root(), result)
+}
+
+func selection_closest(selection:Selection, selector:str) Selection {
+    match selection_try_closest(selection, selector) {
+        success(result) => { return result }
+        failure(error) => { panic("HTML selector error at byte $(error.byte_offset): " + error.detail) }
+    }
+}
+
+func selection_try_closest(selection:Selection, selector:str) Result<Selection, SelectorError> {
+    match SelectorParser(selector).run() {
+        failure(error) => { return Result<Selection, SelectorError>.failure(error) }
+        success(groups) => {
+            var result:Node[] = []
+            for node in selection.raw_nodes() {
+                var current:Node? = node
+                while let candidate = current {
+                    if candidate.is_element() && node_matches(selection.raw_root(), candidate, groups) {
+                        append_unique(result, candidate)
+                        break
+                    }
+                    current = find_parent(selection.raw_root(), candidate)
+                }
+            }
+            return Result<Selection, SelectorError>.success(Selection.from(selection.raw_root(), result))
+        }
+    }
+}
+
+func node_matches(root:Node, node:Node, groups:SelectorGroup[]) bool {
+    var path:Node[] = []
+    if !path_to(root, node, path) { return false }
+    return matches_any(path, groups)
+}
+
+func path_to(current:Node, expected:Node, path:&Node[]) bool {
+    path.append(current)
+    if current == expected { return true }
+    for child in current.raw_children() {
+        if path_to(child, expected, path) { return true }
+    }
+    path.take_last()
+    return false
+}
+
+func find_parent(current:Node, expected:Node) Node? {
+    for child in current.raw_children() {
+        if child == expected { return current }
+        if let found = find_parent(child, expected) { return found }
+    }
+    return null
+}
+
+func append_unique(nodes:&Node[], node:Node) {
+    for existing in nodes { if existing == node { return } }
+    nodes.append(node)
+}
+
+func selector_name_byte(byte:uint8) bool {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+        (byte >= 48 && byte <= 57) || byte == 45 || byte == 95
+}
+
 func encode_node(node:Node, output:&uint8[], pretty:bool, depth:int, inline:bool) {
     let kind = node.raw_kind_value()
     if kind == 1 {
@@ -732,6 +1499,36 @@ func token_contains(value:str, expected:str) bool {
         } else { index++ }
     }
     return false
+}
+
+func require_class_name(name:str) {
+    let bytes = UTF8.bytes(name)
+    if bytes.is_empty() { panic("HTML class name cannot be empty") }
+    for byte in bytes {
+        if whitespace(byte) { panic("HTML class name cannot contain whitespace") }
+    }
+}
+
+func remove_token(value:str, expected:str) str {
+    let bytes = UTF8.bytes(value)
+    var result = ""
+    var start = 0
+    var index = 0
+    while index <= bytes.count() {
+        if index == bytes.count() || whitespace(bytes[index]) {
+            if index > start {
+                let token = input_slice(bytes, start, index)
+                if token != expected {
+                    if result != "" { result += " " }
+                    result += token
+                }
+            }
+            index++
+            while index < bytes.count() && whitespace(bytes[index]) { index++ }
+            start = index
+        } else { index++ }
+    }
+    return result
 }
 
 func void_element(name:str) bool {

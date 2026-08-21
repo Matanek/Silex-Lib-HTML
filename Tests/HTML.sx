@@ -46,3 +46,83 @@ test "parse limits are recoverable" {
         failure(error) => { assert(error.kind == HTML.ParseErrorKind.byte_limit) }
     }
 }
+
+test "select common CSS subsets with recoverable errors" {
+    let source = "<main id=content><article class='card featured' data-kind=news><a href=/one>One</a></article><article class=card><a href=/two>Two</a></article></main>"
+    var document = HTML.parse(source)
+
+    assert(document.select("main > article.card").count() == 2, "type, class and child combinator")
+    var featured_links = document.select("#content article.featured a[href]")
+    assert(featured_links.count() == 1, "descendant, id and attribute presence selectors")
+    if let link = featured_links.first() {
+        if let destination = link.attribute("href") {
+            assert(destination == "/one", "selected node remains fully usable")
+        } else { panic("selected link should retain its href") }
+    } else { panic("featured link should be selected") }
+    assert(document.select("[data-kind='news'], a[href=/two]").count() == 2, "selector groups and attribute values")
+
+    match document.try_select("article:unknown") {
+        success(selection) => { panic("unsupported pseudo selector should fail") }
+        failure(error) => { assert(error.kind == HTML.SelectorErrorKind.syntax) }
+    }
+    match document.try_select("   ") {
+        success(selection) => { panic("empty selector should fail") }
+        failure(error) => { assert(error.kind == HTML.SelectorErrorKind.empty) }
+    }
+    match document.select("main").try_children(":unknown") {
+        success(selection) => { panic("invalid child selector should fail") }
+        failure(error) => { assert(error.kind == HTML.SelectorErrorKind.syntax) }
+    }
+}
+
+test "navigate around a selection without parent reference cycles" {
+    var document = HTML.parse("<section><p id=first>One</p>gap<p id=second><em>Two</em></p><p id=third>Three</p></section>")
+    var second = document.select("#second")
+
+    assert(second.parent().filter("section").count() == 1, "parent")
+    assert(second.siblings().count() == 2, "element siblings ignore text nodes")
+    if let last_sibling = second.siblings().at(-1) {
+        assert(last_sibling.text_content() == "Three", "negative selection index")
+    } else { panic("last sibling should exist") }
+    assert(second.previous().filter("#first").count() == 1, "previous element sibling")
+    assert(second.next().filter("#third").count() == 1, "next element sibling")
+    assert(second.children("em").count() == 1, "filtered direct children")
+    assert(second.find("em").closest("section").count() == 1, "closest ancestor")
+    assert(second.find("em").parents().count() == 2, "all element ancestors")
+}
+
+test "mutate selections and insert independent fragment copies" {
+    var document = HTML.parse("<ul><li class=item>A</li><li class='item  stale'>B</li></ul><p id=old>x</p>")
+    var items = document.select("li.item")
+    items.add_class("ready")
+    assert(items.remove_class("missing") == 0, "absent class removal count")
+    assert(items.remove_class("stale") == 1, "class removal count")
+    items.toggle_class("selected")
+    items.set_attribute("data-state", "active")
+    items.set_text("Updated")
+
+    var badge = HTML.element("strong")
+    badge.append_text("!")
+    items.prepend(badge)
+    document.select("ul").append_all(HTML.parse_fragment("<li class=new>Third</li><li class=new>Fourth</li>"))
+    assert(document.select("li.new").remove() == 2, "remove every selected node")
+
+    var replacement = HTML.element("aside")
+    replacement.append_text("Replacement")
+    assert(document.select("#old").replace_with(replacement) == 1, "replace selected node")
+    assert(
+        HTML.serialize(document) == "<ul><li class=\"item ready selected\" data-state=\"active\"><strong>!</strong>Updated</li><li class=\"item ready selected\" data-state=\"active\"><strong>!</strong>Updated</li></ul><aside>Replacement</aside>",
+        "group mutations preserve deterministic document order"
+    )
+}
+
+test "parse fragments independently of a document wrapper" {
+    var nodes = HTML.parse_fragment("text<span>A</span><!-- note -->")
+    assert(nodes.count() == 3, "fragment node count")
+
+    var container = HTML.element("div")
+    container.append(nodes[0])
+    container.append(nodes[1])
+    container.append(nodes[2])
+    assert(HTML.serialize(container) == "<div>text<span>A</span><!-- note --></div>", "fragment composition")
+}
