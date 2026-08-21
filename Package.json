@@ -1,0 +1,10 @@
+{
+  "name": "HTML",
+  "version": "0.2.0",
+  "requires": {
+    "silex": ">=0.38.37 <0.39.0"
+  },
+  "dependencies": {
+    "STD": "^0.16.7"
+  }
+}

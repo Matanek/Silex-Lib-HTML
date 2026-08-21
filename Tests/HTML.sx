@@ -1,0 +1,48 @@
+use HTML
+
+test "build and serialize escaped mixed content" {
+    var root = HTML.document()
+    var paragraph = root.append_element("p")
+    paragraph.set_attribute("title", "A&B \"quoted\"")
+    paragraph.append_text("Hello <")
+    paragraph.append_element("strong").append_text("Silex")
+    paragraph.append_text(" & HTML")
+
+    assert(
+        HTML.serialize(root) == "<p title=\"A&amp;B &quot;quoted&quot;\">Hello &lt;<strong>Silex</strong> &amp; HTML</p>",
+        "safe mixed-content serialization"
+    )
+}
+
+test "parse common document structure and entities" {
+    let source = "<!doctype html><html><body><main id=content class=\"doc selected\"><p>Hello &amp; <em>friends</em>!</p><img src='/logo.png'></main></body></html>"
+    var document = HTML.parse(source)
+    var main = document.find_by_id("content")
+    assert(main != null, "id lookup")
+    if var element = main {
+        assert(element.has_class("selected"), "class token lookup")
+        assert(element.text_content() == "Hello & friends!", "recursive text content")
+    }
+    if let image_source = document.elements("img")[0].attribute("src") {
+        assert(image_source == "/logo.png", "quoted attribute")
+    } else { panic("image source should be present") }
+    assert(
+        HTML.serialize(document) == "<!doctype html><html><body><main id=\"content\" class=\"doc selected\"><p>Hello &amp; <em>friends</em>!</p><img src=\"/logo.png\"></main></body></html>",
+        "canonical compact serialization"
+    )
+}
+
+test "raw text and comments remain explicit" {
+    let source = "<script>if (a < b) { value = '&'; }</script><!--a--b-->"
+    var document = HTML.parse(source)
+    assert(document.elements("script")[0].text_content() == "if (a < b) { value = '&'; }", "raw script text")
+    assert(HTML.serialize(document) == "<script>if (a < b) { value = '&'; }</script><!--a- -b-->", "safe comment serialization")
+}
+
+test "parse limits are recoverable" {
+    let options = HTML.ParseOptions(maximum_bytes:8, maximum_nodes:8, maximum_depth:8)
+    match HTML.try_parse("<p>too long</p>", options) {
+        success(document) => { panic("byte limit should fail") }
+        failure(error) => { assert(error.kind == HTML.ParseErrorKind.byte_limit) }
+    }
+}

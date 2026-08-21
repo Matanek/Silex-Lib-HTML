@@ -1,0 +1,765 @@
+use Interop.C
+use STD.Text.UTF8
+
+public enum Kind {
+    document
+    doctype
+    element
+    text
+    raw_text
+    comment
+}
+
+public enum Format {
+    compact
+    pretty
+}
+
+public struct Attribute {
+    let name:str
+    let value:str
+}
+
+public struct ParseOptions {
+    let maximum_bytes:int
+    let maximum_nodes:int
+    let maximum_depth:int
+}
+
+public enum ParseErrorKind {
+    byte_limit
+    node_limit
+    depth_limit
+}
+
+public struct ParseError {
+    let kind:ParseErrorKind
+    let byte_offset:int
+    let line:int
+    let column:int
+    let detail:str
+}
+
+public class Node {
+    private let raw_kind:int
+    private var node_name:str
+    private var node_value:str
+    private var node_attributes:Attribute[]
+    private var node_children:Node[]
+
+    private init(raw_kind:int, name:str, value:str) {
+        self.raw_kind = raw_kind
+        self.node_name = name
+        self.node_value = value
+        self.node_attributes = []
+        self.node_children = []
+    }
+
+    static func document() Node { return Node(1, "", "") }
+    static func doctype(name:str = "html") Node { return Node(2, ascii_lower(name), "") }
+
+    static func element(name:str) Node {
+        let normalized = ascii_lower(name)
+        if !valid_name(normalized) { panic("invalid HTML element name '$(name)'") }
+        return Node(3, normalized, "")
+    }
+
+    static func text(value:str) Node { return Node(4, "", value) }
+    static func raw_text(value:str) Node { return Node(5, "", value) }
+    static func comment(value:str) Node { return Node(6, "", value) }
+
+    func kind() Kind {
+        if self.raw_kind == 1 { return Kind.document }
+        if self.raw_kind == 2 { return Kind.doctype }
+        if self.raw_kind == 3 { return Kind.element }
+        if self.raw_kind == 4 { return Kind.text }
+        if self.raw_kind == 5 { return Kind.raw_text }
+        return Kind.comment
+    }
+
+    func name() str? {
+        if self.raw_kind == 2 || self.raw_kind == 3 { return self.node_name }
+        return null
+    }
+
+    func value() str? {
+        if self.raw_kind == 4 || self.raw_kind == 5 || self.raw_kind == 6 { return self.node_value }
+        return null
+    }
+
+    func attributes() Attribute[] { return self.node_attributes }
+    func children() Node[] { return self.node_children }
+
+    func attribute(name:str) str? {
+        let normalized = ascii_lower(name)
+        for attribute in self.node_attributes {
+            if attribute.name == normalized { return attribute.value }
+        }
+        return null
+    }
+
+    func has_attribute(name:str) bool { return self.attribute(name) != null }
+
+    func set_attribute(name:str, value:str = "") {
+        self.require_element("set_attribute")
+        let normalized = ascii_lower(name)
+        if !valid_name(normalized) { panic("invalid HTML attribute name '$(name)'") }
+        var index = 0
+        while index < self.node_attributes.count() {
+            if self.node_attributes[index].name == normalized {
+                self.node_attributes[index] = Attribute(name:normalized, value:value)
+                return
+            }
+            index++
+        }
+        self.node_attributes.append(Attribute(name:normalized, value:value))
+    }
+
+    func remove_attribute(name:str) bool {
+        self.require_element("remove_attribute")
+        let normalized = ascii_lower(name)
+        var index = 0
+        while index < self.node_attributes.count() {
+            if self.node_attributes[index].name == normalized {
+                self.node_attributes.take(index)
+                return true
+            }
+            index++
+        }
+        return false
+    }
+
+    func append(child:Node) {
+        if self.raw_kind != 1 && self.raw_kind != 3 {
+            panic("HTML children can only be appended to a document or element")
+        }
+        self.node_children.append(child)
+    }
+
+    func append_element(name:str) Node {
+        var child = Node.element(name)
+        self.append(child)
+        return child
+    }
+
+    func append_text(value:str) Node {
+        var child = Node.text(value)
+        self.append(child)
+        return child
+    }
+
+    // Raw text is an explicit escape hatch for script/style source and parsed
+    // raw-text elements. It is serialized without HTML escaping.
+    func append_raw_text(value:str) Node {
+        var child = Node.raw_text(value)
+        self.append(child)
+        return child
+    }
+
+    func append_comment(value:str) Node {
+        var child = Node.comment(value)
+        self.append(child)
+        return child
+    }
+
+    func text_content() str {
+        if self.raw_kind == 4 || self.raw_kind == 5 { return self.node_value }
+        var result = ""
+        for child in self.node_children { result += child.text_content() }
+        return result
+    }
+
+    func elements(name:str) Node[] {
+        var result:Node[] = []
+        let normalized = ascii_lower(name)
+        self.collect_elements(normalized, result)
+        return result
+    }
+
+    func find_by_id(id:str) Node? {
+        if self.raw_kind == 3 {
+            if let value = self.attribute("id") {
+                if value == id { return self }
+            }
+        }
+        for child in self.node_children {
+            if let found = child.find_by_id(id) { return found }
+        }
+        return null
+    }
+
+    func has_class(name:str) bool {
+        if let value = self.attribute("class") { return token_contains(value, name) }
+        return false
+    }
+
+    private func require_element(operation:str) {
+        if self.raw_kind != 3 { panic("HTML $(operation) requires an element") }
+    }
+
+    private func collect_elements(name:str, output:&Node[]) {
+        if self.raw_kind == 3 && (name == "*" || self.node_name == name) { output.append(self) }
+        for child in self.node_children { child.collect_elements(name, output) }
+    }
+
+    package func raw_name() str { return self.node_name }
+    package func raw_value() str { return self.node_value }
+    package func raw_attributes() Attribute[] { return self.node_attributes }
+    package func raw_children() Node[] { return self.node_children }
+    package func raw_kind_value() int { return self.raw_kind }
+}
+
+public func document() Node { return Node.document() }
+public func element(name:str) Node { return Node.element(name) }
+public func text(value:str) Node { return Node.text(value) }
+public func comment(value:str) Node { return Node.comment(value) }
+
+public func html_document(title:str, language:str = "en") Node {
+    var result = Node.document()
+    result.append(Node.doctype())
+    var html = result.append_element("html")
+    html.set_attribute("lang", language)
+    var head = html.append_element("head")
+    var charset = head.append_element("meta")
+    charset.set_attribute("charset", "utf-8")
+    var viewport = head.append_element("meta")
+    viewport.set_attribute("name", "viewport")
+    viewport.set_attribute("content", "width=device-width, initial-scale=1")
+    head.append_element("title").append_text(title)
+    html.append_element("body")
+    return result
+}
+
+public func default_parse_options() ParseOptions {
+    return ParseOptions(
+        maximum_bytes:8 * 1024 * 1024,
+        maximum_nodes:250_000,
+        maximum_depth:512
+    )
+}
+
+public func try_parse(source:str) Result<Node, ParseError> {
+    return try_parse(source, default_parse_options())
+}
+
+public func try_parse(source:str, options:ParseOptions) Result<Node, ParseError> {
+    return Parser(source, options).run()
+}
+
+public func parse(source:str) Node { return parse(source, default_parse_options()) }
+
+public func parse(source:str, options:ParseOptions) Node {
+    match try_parse(source, options) {
+        success(document) => { return document }
+        failure(error) => { panic("$(error.line):$(error.column): " + error.detail) }
+    }
+}
+
+public func serialize(node:Node) str { return serialize(node, Format.compact) }
+
+public func serialize(node:Node, format:Format) str {
+    var output:uint8[] = []
+    encode_node(node, output, format == Format.pretty, 0, false)
+    return C.string(@output[0:output.count()])
+}
+
+class Parser {
+    private let input:uint8[]
+    private let options:ParseOptions
+    private var offset:int
+    private var node_count:int
+
+    init(source:str, options:ParseOptions) {
+        self.input = UTF8.bytes(source)
+        self.options = options
+        self.offset = 0
+        self.node_count = 1
+    }
+
+    func run() Result<Node, ParseError> {
+        if self.options.maximum_bytes < 0 || self.input.count() > self.options.maximum_bytes {
+            return self.failure(ParseErrorKind.byte_limit, "HTML input exceeds maximum_bytes")
+        }
+        if self.options.maximum_nodes < 1 {
+            return self.failure(ParseErrorKind.node_limit, "maximum_nodes must be positive")
+        }
+        if self.options.maximum_depth < 1 {
+            return self.failure(ParseErrorKind.depth_limit, "maximum_depth must be positive")
+        }
+        var root = Node.document()
+        var stack:Node[] = [root]
+        while self.offset < self.input.count() {
+            if self.input[self.offset] != 60 {
+                var text_result = self.text_node()
+                if text_result.raw_value().count() > 0 {
+                    if let error = self.append_node(stack[stack.count() - 1], text_result, stack.count()) {
+                        return Result<Node, ParseError>.failure(error)
+                    }
+                }
+                continue
+            }
+            if starts_at(self.input, self.offset, "<!--", false) {
+                var comment_result = self.comment_node()
+                if let error = self.append_node(stack[stack.count() - 1], comment_result, stack.count()) {
+                    return Result<Node, ParseError>.failure(error)
+                }
+                continue
+            }
+            if starts_at(self.input, self.offset, "<!doctype", true) {
+                var doctype_result = self.doctype_node()
+                if let error = self.append_node(stack[stack.count() - 1], doctype_result, stack.count()) {
+                    return Result<Node, ParseError>.failure(error)
+                }
+                continue
+            }
+            if starts_at(self.input, self.offset, "</", false) {
+                self.close_element(stack)
+                continue
+            }
+            if self.offset + 1 < self.input.count() && name_byte(self.input[self.offset + 1]) {
+                match self.open_element(stack) {
+                    success => {}
+                    failure(error) => { return Result<Node, ParseError>.failure(error) }
+                }
+                continue
+            }
+            if self.node_count >= self.options.maximum_nodes {
+                return self.failure(ParseErrorKind.node_limit, "HTML document exceeds maximum_nodes")
+            }
+            stack[stack.count() - 1].append_text("<")
+            self.node_count++
+            self.offset++
+        }
+        return Result<Node, ParseError>.success(root)
+    }
+
+    private func text_node() Node {
+        let start = self.offset
+        while self.offset < self.input.count() && self.input[self.offset] != 60 { self.offset++ }
+        return Node.text(decode_entities(input_slice(self.input, start, self.offset)))
+    }
+
+    private func comment_node() Node {
+        self.offset += 4
+        let start = self.offset
+        while self.offset + 2 < self.input.count() && !starts_at(self.input, self.offset, "-->", false) { self.offset++ }
+        let end = self.offset
+        if self.offset + 2 < self.input.count() { self.offset += 3 }
+        else { self.offset = self.input.count() }
+        return Node.comment(input_slice(self.input, start, end))
+    }
+
+    private func doctype_node() Node {
+        self.offset += 9
+        self.space()
+        let start = self.offset
+        while self.offset < self.input.count() && name_byte(self.input[self.offset]) { self.offset++ }
+        var name = input_slice(self.input, start, self.offset)
+        if name == "" { name = "html" }
+        self.skip_tag_end()
+        return Node.doctype(name)
+    }
+
+    private func close_element(stack:&Node[]) {
+        self.offset += 2
+        self.space()
+        let start = self.offset
+        while self.offset < self.input.count() && name_byte(self.input[self.offset]) { self.offset++ }
+        let name = ascii_lower(input_slice(self.input, start, self.offset))
+        self.skip_tag_end()
+        var index = stack.count() - 1
+        while index > 0 {
+            if stack[index].raw_name() == name {
+                while stack.count() - 1 >= index { stack.take_last() }
+                return
+            }
+            index--
+        }
+    }
+
+    private func open_element(stack:&Node[]) Result<void, ParseError> {
+        self.offset++
+        let start = self.offset
+        while self.offset < self.input.count() && name_byte(self.input[self.offset]) { self.offset++ }
+        let name = ascii_lower(input_slice(self.input, start, self.offset))
+        self.close_optional_element(stack, name)
+        var opened = Node.element(name)
+        self.space()
+        var self_closing = false
+        while self.offset < self.input.count() && self.input[self.offset] != 62 {
+            if self.input[self.offset] == 47 {
+                self.offset++
+                self.space()
+                self_closing = true
+                continue
+            }
+            let attribute_start = self.offset
+            while self.offset < self.input.count() && attribute_name_byte(self.input[self.offset]) { self.offset++ }
+            if attribute_start == self.offset {
+                self.offset++
+                self.space()
+                continue
+            }
+            let attribute_name = ascii_lower(input_slice(self.input, attribute_start, self.offset))
+            self.space()
+            var value = ""
+            if self.offset < self.input.count() && self.input[self.offset] == 61 {
+                self.offset++
+                self.space()
+                value = self.attribute_value()
+            }
+            if !opened.has_attribute(attribute_name) { opened.set_attribute(attribute_name, decode_entities(value)) }
+            self.space()
+        }
+        if self.offset < self.input.count() { self.offset++ }
+        let depth = stack.count()
+        var parent = stack.take_last()
+        let append_error = self.append_node(parent, opened, depth)
+        stack.append(parent)
+        if let error = append_error {
+            return Result<void, ParseError>.failure(error)
+        }
+        if !self_closing && !void_element(name) {
+            if depth >= self.options.maximum_depth {
+                return self.failure_void(ParseErrorKind.depth_limit, "HTML nesting exceeds maximum_depth")
+            }
+            stack.append(opened)
+            if raw_text_element(name) { return self.consume_raw_text(stack, opened, name) }
+        }
+        return Result<void, ParseError>.success()
+    }
+
+    private func consume_raw_text(stack:&Node[], element:Node, name:str) Result<void, ParseError> {
+        let start = self.offset
+        while self.offset < self.input.count() && !starts_at(self.input, self.offset, "</" + name, true) { self.offset++ }
+        if self.offset > start {
+            var raw = Node.raw_text(input_slice(self.input, start, self.offset))
+            if let error = self.append_node(element, raw, stack.count()) {
+                return Result<void, ParseError>.failure(error)
+            }
+        }
+        if self.offset < self.input.count() { self.close_element(stack) }
+        return Result<void, ParseError>.success()
+    }
+
+    private func attribute_value() str {
+        if self.offset >= self.input.count() { return "" }
+        let quote = self.input[self.offset]
+        if quote == 34 || quote == 39 {
+            self.offset++
+            let start = self.offset
+            while self.offset < self.input.count() && self.input[self.offset] != quote { self.offset++ }
+            let result = input_slice(self.input, start, self.offset)
+            if self.offset < self.input.count() { self.offset++ }
+            return result
+        }
+        let start = self.offset
+        while self.offset < self.input.count() {
+            let byte = self.input[self.offset]
+            if whitespace(byte) || byte == 62 { break }
+            self.offset++
+        }
+        return input_slice(self.input, start, self.offset)
+    }
+
+    private func append_node(parent:Node, child:Node, depth:int) ParseError? {
+        if depth > self.options.maximum_depth {
+            return self.error(ParseErrorKind.depth_limit, "HTML nesting exceeds maximum_depth")
+        }
+        if self.node_count >= self.options.maximum_nodes {
+            return self.error(ParseErrorKind.node_limit, "HTML document exceeds maximum_nodes")
+        }
+        parent.append(child)
+        self.node_count++
+        return null
+    }
+
+    private func close_optional_element(stack:&Node[], incoming:str) {
+        if stack.count() <= 1 { return }
+        let current = stack[stack.count() - 1].raw_name()
+        if (incoming == "li" && current == "li") || (incoming == "p" && current == "p") {
+            stack.take_last()
+            return
+        }
+        if current == "p" && block_element(incoming) { stack.take_last() }
+    }
+
+    private func skip_tag_end() {
+        while self.offset < self.input.count() && self.input[self.offset] != 62 { self.offset++ }
+        if self.offset < self.input.count() { self.offset++ }
+    }
+
+    private func space() {
+        while self.offset < self.input.count() && whitespace(self.input[self.offset]) { self.offset++ }
+    }
+
+    private func error(kind:ParseErrorKind, detail:str) ParseError {
+        var line = 1
+        var column = 1
+        var index = 0
+        while index < self.offset {
+            let byte = self.input[index]
+            if byte == 10 { line++; column = 1 }
+            elif byte < 128 || byte >= 192 { column++ }
+            index++
+        }
+        return ParseError(kind:kind, byte_offset:self.offset, line:line, column:column, detail:detail)
+    }
+
+    private func failure(kind:ParseErrorKind, detail:str) Result<Node, ParseError> {
+        return Result<Node, ParseError>.failure(self.error(kind, detail))
+    }
+
+    private func failure_void(kind:ParseErrorKind, detail:str) Result<void, ParseError> {
+        return Result<void, ParseError>.failure(self.error(kind, detail))
+    }
+}
+
+func encode_node(node:Node, output:&uint8[], pretty:bool, depth:int, inline:bool) {
+    let kind = node.raw_kind_value()
+    if kind == 1 {
+        for child in node.raw_children() { encode_node(child, output, pretty, depth, false) }
+        return
+    }
+    if pretty && !inline { append_indent(output, depth) }
+    if kind == 2 {
+        append_bytes(output, "<!doctype " + node.raw_name() + ">")
+        if pretty { output.append(10 as uint8) }
+        return
+    }
+    if kind == 4 {
+        append_escaped(output, node.raw_value(), false)
+        return
+    }
+    if kind == 5 {
+        append_bytes(output, node.raw_value())
+        return
+    }
+    if kind == 6 {
+        append_bytes(output, "<!--" + safe_comment(node.raw_value()) + "-->")
+        if pretty && !inline { output.append(10 as uint8) }
+        return
+    }
+    let name = node.raw_name()
+    append_bytes(output, "<" + name)
+    for attribute in node.raw_attributes() {
+        append_bytes(output, " " + attribute.name + "=\"")
+        append_escaped(output, attribute.value, true)
+        output.append(34 as uint8)
+    }
+    output.append(62 as uint8)
+    if void_element(name) {
+        if pretty && !inline { output.append(10 as uint8) }
+        return
+    }
+    var children = node.raw_children()
+    let children_inline = contains_text(children)
+    if pretty && children.count() > 0 && !children_inline { output.append(10 as uint8) }
+    for child in children { encode_node(child, output, pretty, depth + 1, children_inline) }
+    if pretty && children.count() > 0 && !children_inline { append_indent(output, depth) }
+    append_bytes(output, "</" + name + ">")
+    if pretty && !inline { output.append(10 as uint8) }
+}
+
+func append_escaped(output:&uint8[], value:str, attribute:bool) {
+    let bytes = UTF8.bytes(value)
+    for byte in bytes {
+        if byte == 38 { append_bytes(output, "&amp;") }
+        elif byte == 60 { append_bytes(output, "&lt;") }
+        elif byte == 62 { append_bytes(output, "&gt;") }
+        elif attribute && byte == 34 { append_bytes(output, "&quot;") }
+        else { output.append(byte) }
+    }
+}
+
+func append_bytes(output:&uint8[], value:str) {
+    for byte in UTF8.bytes(value) { output.append(byte) }
+}
+
+func append_indent(output:&uint8[], depth:int) {
+    var index = 0
+    while index < depth { output.append(32 as uint8); output.append(32 as uint8); index++ }
+}
+
+func contains_text(nodes:Node[]) bool {
+    for node in nodes {
+        let kind = node.raw_kind_value()
+        if kind == 4 || kind == 5 { return true }
+    }
+    return false
+}
+
+func safe_comment(value:str) str {
+    let bytes = UTF8.bytes(value)
+    var output:uint8[] = []
+    var index = 0
+    while index < bytes.count() {
+        if index + 1 < bytes.count() && bytes[index] == 45 && bytes[index + 1] == 45 {
+            output.append(45 as uint8)
+            output.append(32 as uint8)
+            output.append(45 as uint8)
+            index += 2
+        } else {
+            output.append(bytes[index])
+            index++
+        }
+    }
+    return C.string(@output[0:output.count()])
+}
+
+func decode_entities(value:str) str {
+    let bytes = UTF8.bytes(value)
+    var output:uint8[] = []
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] != 38 {
+            output.append(bytes[index])
+            index++
+            continue
+        }
+        var end = index + 1
+        while end < bytes.count() && end - index <= 16 && bytes[end] != 59 && !whitespace(bytes[end]) && bytes[end] != 60 { end++ }
+        if end >= bytes.count() || bytes[end] != 59 {
+            output.append(38 as uint8)
+            index++
+            continue
+        }
+        let entity = input_slice(bytes, index + 1, end)
+        if let decoded = entity_text(entity) {
+            append_bytes(output, decoded)
+            index = end + 1
+        } else {
+            output.append(38 as uint8)
+            index++
+        }
+    }
+    return C.string(@output[0:output.count()])
+}
+
+func entity_text(entity:str) str? {
+    if entity == "amp" { return "&" }
+    if entity == "lt" { return "<" }
+    if entity == "gt" { return ">" }
+    if entity == "quot" { return "\"" }
+    if entity == "apos" { return "'" }
+    if entity == "nbsp" { return " " }
+    let bytes = UTF8.bytes(entity)
+    if bytes.count() < 2 || bytes[0] != 35 { return null }
+    var start = 1
+    var base = 10
+    if bytes.count() > 2 && (bytes[1] == 120 || bytes[1] == 88) { start = 2; base = 16 }
+    var scalar:uint32 = 0
+    var index = start
+    while index < bytes.count() {
+        var digit = decimal_digit(bytes[index])
+        if base == 16 { digit = hex_digit(bytes[index]) }
+        if digit < 0 { return null }
+        scalar = scalar * (base as uint32) + digit as uint32
+        if scalar > 1_114_111 { return null }
+        index++
+    }
+    if index == start || scalar == 0 || (scalar >= 55_296 && scalar <= 57_343) { return null }
+    var scalars:uint32[] = [scalar]
+    match UTF8.from_scalars(@scalars[0:1]) {
+        success(text) => { return text }
+        failure(error) => { return null }
+    }
+}
+
+func input_slice(input:uint8[], start:int, end:int) str {
+    if start >= end { return "" }
+    return C.string(@input[start:end])
+}
+
+func ascii_lower(value:str) str {
+    var bytes = UTF8.bytes(value)
+    var index = 0
+    while index < bytes.count() {
+        if bytes[index] >= 65 && bytes[index] <= 90 { bytes[index] += 32 }
+        index++
+    }
+    return C.string(@bytes[0:bytes.count()])
+}
+
+func valid_name(value:str) bool {
+    let bytes = UTF8.bytes(value)
+    if bytes.count() == 0 { return false }
+    for byte in bytes { if !name_byte(byte) { return false } }
+    return true
+}
+
+func name_byte(byte:uint8) bool {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+        (byte >= 48 && byte <= 57) || byte == 45 || byte == 95 || byte == 58
+}
+
+func attribute_name_byte(byte:uint8) bool {
+    return !whitespace(byte) && byte != 0 && byte != 34 && byte != 39 &&
+        byte != 47 && byte != 60 && byte != 61 && byte != 62
+}
+
+func whitespace(byte:uint8) bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+func starts_at(input:uint8[], offset:int, expected:str, ignore_case:bool) bool {
+    let bytes = UTF8.bytes(expected)
+    if offset + bytes.count() > input.count() { return false }
+    var index = 0
+    while index < bytes.count() {
+        var actual = input[offset + index]
+        var wanted = bytes[index]
+        if ignore_case {
+            if actual >= 65 && actual <= 90 { actual += 32 }
+            if wanted >= 65 && wanted <= 90 { wanted += 32 }
+        }
+        if actual != wanted { return false }
+        index++
+    }
+    return true
+}
+
+func token_contains(value:str, expected:str) bool {
+    let bytes = UTF8.bytes(value)
+    var start = 0
+    var index = 0
+    while index <= bytes.count() {
+        if index == bytes.count() || whitespace(bytes[index]) {
+            if input_slice(bytes, start, index) == expected { return true }
+            index++
+            while index < bytes.count() && whitespace(bytes[index]) { index++ }
+            start = index
+        } else { index++ }
+    }
+    return false
+}
+
+func void_element(name:str) bool {
+    return name == "area" || name == "base" || name == "br" || name == "col" ||
+        name == "embed" || name == "hr" || name == "img" || name == "input" ||
+        name == "link" || name == "meta" || name == "param" || name == "source" ||
+        name == "track" || name == "wbr"
+}
+
+func raw_text_element(name:str) bool { return name == "script" || name == "style" }
+
+func block_element(name:str) bool {
+    return name == "address" || name == "article" || name == "aside" || name == "blockquote" ||
+        name == "div" || name == "dl" || name == "fieldset" || name == "footer" ||
+        name == "form" || name == "h1" || name == "h2" || name == "h3" || name == "h4" ||
+        name == "h5" || name == "h6" || name == "header" || name == "hr" || name == "main" ||
+        name == "nav" || name == "ol" || name == "p" || name == "pre" || name == "section" ||
+        name == "table" || name == "ul"
+}
+
+func decimal_digit(byte:uint8) int {
+    if byte >= 48 && byte <= 57 { return (byte - 48) as int }
+    return -1
+}
+
+func hex_digit(byte:uint8) int {
+    if byte >= 48 && byte <= 57 { return (byte - 48) as int }
+    if byte >= 65 && byte <= 70 { return (byte - 55) as int }
+    if byte >= 97 && byte <= 102 { return (byte - 87) as int }
+    return -1
+}
