@@ -36,7 +36,7 @@ The direct methods panic on an invalid selector. `try_select`, `try_find`,
 `try_filter`, `try_children` and `try_closest` return a `SelectorError` for input
 that comes from users or external systems. Pseudo-classes, pseudo-elements, CSS
 escapes, sibling combinators and attribute operators other than exact equality
-are not part of version 0.3.
+are not part of version 0.4.
 
 ## Transforming a document
 
@@ -69,7 +69,7 @@ The parser covers document structure, quoted and unquoted attributes, comments,
 doctypes, standard numeric entities and the common named entities `amp`, `lt`,
 `gt`, `quot`, `apos` and `nbsp`. It does not claim the full HTML Living Standard
 tree-construction algorithm yet; browser-specific foster parenting and the
-complete named-entity catalog remain outside version 0.3.
+complete named-entity catalog remain outside version 0.4.
 
 ## Development
 
