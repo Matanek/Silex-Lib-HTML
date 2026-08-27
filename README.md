@@ -78,6 +78,9 @@ From the Silex project workspace root:
 ```text
 silex link Packages/HTML
 silex test Packages/HTML/Tests
-silex run Packages/HTML/Examples/BuildAndParse.sx
-silex run Packages/HTML/Examples/SelectAndTransform.sx
 ```
+
+See [Docs/Recipes.md](Docs/Recipes.md) for complete construction, parsing,
+selection and transformation recipes. The generated-HTML application belongs
+to the central [Silex-Examples](https://github.com/Matanek/Silex-Examples)
+showcase.
