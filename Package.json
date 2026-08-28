@@ -1,13 +1,13 @@
 {
   "name": "HTML",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": {
     "en": "Build, parse, select, transform, and serialize HTML documents.",
     "fr": "Construit, analyse, sélectionne, transforme et sérialise des documents HTML."
   },
   "authors": ["Matanek"],
   "requires": {
-    "silex": ">=0.42.0"
+    "silex": ">=0.43.0"
   },
   "dependencies": {
     "STD": "^0.16.7"
