@@ -1,6 +1,6 @@
 {
   "name": "HTML",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": {
     "en": "Build, parse, select, transform, and serialize HTML documents.",
     "fr": "Construit, analyse, sélectionne, transforme et sérialise des documents HTML."
